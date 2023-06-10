@@ -1,0 +1,396 @@
+"""
+txcons.py
+
+Transaction Constructors for the blockchain.
+"""
+
+from collections import defaultdict
+from asset import AssetTarget
+from coloredcoinlib import (ColorSet, ColorTarget, SimpleColorValue,
+                            ComposedTxSpec, OperationalTxSpec,
+                            UNCOLORED_MARKER, OBColorDefinition,
+                            InvalidColorIdError, ZeroSelectError)
+from binascii import hexlify
+import pycoin_txcons
+
+import io
+import math
+
+
+class InsufficientFundsError(Exception):
+    pass
+
+
+class InvalidTargetError(Exception):
+    pass
+
+
+class InvalidTransformationError(Exception):
+    pass
+
+
+class BasicTxSpec(object):
+    """Represents a really simple colored coin transaction.
+    Specifically, this particular transaction class has not been
+    constructed, composed or signed. Those are done in other classes.
+    Note this only supports a single asset.
+    """
+    def __init__(self, model):
+        """Create a BasicTxSpec that has a wallet_model <model>
+        for an asset <asset>
+        """
+        self.model = model
+        self.targets = []
+
+    def add_target(self, asset_target):
+        """Add a ColorTarget <color_target> which specifies the
+        colorvalue and address
+        """
+        if not isinstance(asset_target, AssetTarget):
+            raise InvalidTargetError("Not an asset target!")
+        self.targets.append(asset_target)
+
+    def is_monoasset(self):
+        """Returns a boolean representing if the transaction sends
+        coins of exactly 1 color.
+        """
+        if not self.targets:
+            raise InvalidTargetError('Basic txs is empty!')
+        asset = self.targets[0].get_asset()
+        for target in self.targets:
+            if target.get_asset() != asset:
+                return False
+        return True
+
+    def is_monocolor(self):
+        """Returns a boolean representing if the transaction sends
+        coins of exactly 1 color.
+        """
+        if not self.is_monoasset():
+            return False
+        asset = self.targets[0].get_asset()
+        return len(asset.get_color_set().color_id_set) == 1
+
+    def make_operational_tx_spec(self, asset):
+        """Given a <tx_spec> of type BasicTxSpec, return
+        a SimpleOperationalTxSpec.
+        """
+        if not self.is_monocolor():
+            raise InvalidTransformationError('Tx spec type not supported!')
+        op_tx_spec = SimpleOperationalTxSpec(self.model, asset)
+        color_id = list(asset.get_color_set().color_id_set)[0]
+        color_def = self.model.get_color_def(color_id)
+        for target in self.targets:
+            colorvalue = SimpleColorValue(colordef=color_def,
+                                          value=target.get_value())
+            colortarget = ColorTarget(target.get_address(), colorvalue)
+            op_tx_spec.add_target(colortarget)
+        return op_tx_spec
+
+
+class BaseOperationalTxSpec(OperationalTxSpec):
+    def get_required_fee(self, tx_size):
+        """Given a transaction that is of size <tx_size>,
+        return the transaction fee in Satoshi that needs to be
+        paid out to miners.
+        """
+        base_fee = 11000.0
+        fee_value = math.ceil((tx_size * base_fee) / 1000)
+        return SimpleColorValue(colordef=UNCOLORED_MARKER,
+                                value=fee_value)
+
+    def get_dust_threshold(self):
+        return SimpleColorValue(colordef=UNCOLORED_MARKER, value=600)
+
+    def _select_enough_coins(self, colordef, utxo_list, required_sum_fn):
+        ssum = SimpleColorValue(colordef=colordef, value=0)
+        selection = []
+        required_sum = None
+        for utxo in utxo_list:
+            ssum += SimpleColorValue.sum(utxo.colorvalues)
+            selection.append(utxo)
+            required_sum = required_sum_fn(utxo_list)
+            if ssum >= required_sum:
+                return selection, ssum
+        raise InsufficientFundsError('Not enough coins: %s requested, %s found!'
+                                     % (required_sum, ssum))
+
+    def _validate_select_coins_parameters(self, colorvalue, use_fee_estimator):
+        fee = None
+        if use_fee_estimator:
+            fee = use_fee_estimator.estimate_required_fee()
+        if not fee and colorvalue.get_value() < 0:
+            raise Exception("Cannot select negative coins!")
+        elif fee and (colorvalue + fee).get_value() < 0:
+            raise Exception("Cannot select negative coins!")
+        colordef = colorvalue.get_colordef()
+        if colordef != UNCOLORED_MARKER and use_fee_estimator:
+            msg = "Fee estimator can only be used with uncolored coins!"
+            raise Exception(msg)
+
+
+class SimpleOperationalTxSpec(BaseOperationalTxSpec):
+    """Subclass of OperationalTxSpec which uses wallet model.
+    Represents a transaction that's ready to be composed
+    and then signed. The parent is an abstract class.
+    """
+    def __init__(self, model, asset):
+        """Initialize a transaction that uses a wallet model
+        <model> and transfers asset/color <asset>.
+        """
+        super(SimpleOperationalTxSpec, self).__init__()
+        self.model = model
+        self.targets = []
+        self.asset = asset
+
+    def add_target(self, color_target):
+        """Add a ColorTarget <color_target> to the transaction
+        """
+        if not isinstance(color_target, ColorTarget):
+            raise InvalidTargetError("Target is not an instance of ColorTarget!")
+        self.targets.append(color_target)
+
+    def get_targets(self):
+        """Get a list of (receiving address, color_id, colorvalue)
+        triplets representing all the targets for this tx.
+        """
+        return self.targets
+
+    def get_change_addr(self, color_def):
+        """Get an address associated with color definition <color_def>
+        that is in the current wallet for receiving change.
+        """
+        am = self.model.get_asset_definition_manager()
+        wam = self.model.get_address_manager()
+
+        color_id = color_def.color_id
+        asset = am.get_asset_by_color_id(color_id)
+
+        color_set = None
+        if color_def == UNCOLORED_MARKER:
+            color_set = ColorSet.from_color_ids(self.model.get_color_map(), [0])
+        elif asset.get_color_set().has_color_id(color_id):
+            color_set = asset.get_color_set()
+        if color_set is None:
+            raise InvalidColorIdError('Wrong color id!')
+        aw = wam.get_change_address(color_set)
+        return aw.get_address()
+
+    def select_coins(self, colorvalue, use_fee_estimator=None):
+        """Return a list of utxos and sum that corresponds to
+        the colored coins identified by <color_def> of amount <colorvalue>
+        that we'll be spending from our wallet.
+        """
+        self._validate_select_coins_parameters(colorvalue, use_fee_estimator)
+        def required_sum_fn(selection):
+            if use_fee_estimator:
+                return colorvalue + use_fee_estimator.estimate_required_fee(
+                    extra_txins=len(selection))
+            else:
+                return colorvalue
+        required_sum_0 = required_sum_fn([])
+        if required_sum_0.get_value() == 0:
+            # no coins need to be selected
+            return [], required_sum_0
+        colordef = colorvalue.get_colordef()
+        color_id = colordef.get_color_id()
+        cq = self.model.make_coin_query({"color_id_set": set([color_id])})
+        utxo_list = cq.get_result()
+        return self._select_enough_coins(colordef, utxo_list, required_sum_fn)
+
+
+
+class RawTxSpec(object):
+    """Represents a transaction which can be serialized.
+    """
+    def __init__(self, model, pycoin_tx, composed_tx_spec=None):
+        self.model = model
+        self.pycoin_tx = pycoin_tx
+        self.composed_tx_spec = composed_tx_spec
+        self.update_tx_data()
+        self.intent = None
+
+    def get_intent(self):
+        return self.intent
+
+    def get_hex_txhash(self):
+        the_hash = self.pycoin_tx.hash()
+        return the_hash[::-1].encode('hex')
+
+    def update_tx_data(self):
+        """Updates serialized form of transaction.
+        """
+        s = io.BytesIO()
+        self.pycoin_tx.stream(s)
+        self.tx_data = s.getvalue()
+
+    @classmethod
+    def from_composed_tx_spec(cls, model, composed_tx_spec):
+        testnet = model.is_testnet()
+        tx = pycoin_txcons.construct_standard_tx(composed_tx_spec, testnet)
+        return cls(model, tx, composed_tx_spec)
+
+    @classmethod
+    def from_tx_data(cls, model, tx_data):
+        pycoin_tx = pycoin_txcons.deserialize(tx_data)
+        composed_tx_spec = pycoin_txcons.reconstruct_composed_tx_spec(
+            model, pycoin_tx)
+        return cls(model, pycoin_tx, composed_tx_spec)
+
+    def sign(self, utxo_list):
+        pycoin_txcons.sign_tx(
+            self.pycoin_tx, utxo_list, self.model.is_testnet())
+        self.update_tx_data()
+
+    def get_tx_data(self):
+        """Returns the signed transaction data.
+        """
+        return self.tx_data
+
+    def get_hex_tx_data(self):
+        """Returns the hex version of the signed transaction data.
+        """
+        return hexlify(self.tx_data).decode("utf8")
+
+    def get_input_addresses(self):
+        ccc = self.model.ccc
+        bs = self.model.get_blockchain_state()
+        inputs = [ti.get_outpoint() for ti in self.composed_tx_spec.txins]
+        raw_addrs = [bs.get_tx(tx).outputs[n].raw_address for tx, n in inputs]
+        return [ccc.raw_to_address(raw) for raw in raw_addrs]
+
+def compose_uncolored_tx(tx_spec):
+    """ compose a simple bitcoin transaction """
+    composed_tx_spec = tx_spec.make_composed_tx_spec()
+    targets = tx_spec.get_targets()
+    composed_tx_spec.add_txouts(targets)
+    ttotal = ColorTarget.sum(targets)
+    sel_utxos, sum_sel_coins = tx_spec.select_coins(ttotal, composed_tx_spec)
+    composed_tx_spec.add_txins(sel_utxos)
+    fee = composed_tx_spec.estimate_required_fee()
+    change = sum_sel_coins - ttotal - fee
+    # give ourselves the change
+    if change > tx_spec.get_dust_threshold():
+        composed_tx_spec.add_txout(value=change,
+                                   target_addr=tx_spec.get_change_addr(UNCOLORED_MARKER),
+                                   is_fee_change=True)
+    return composed_tx_spec
+
+
+class TransactionSpecTransformer(object):
+    """An object that can transform one type of transaction into another.
+    Essentially has the ability to take a transaction, compose it
+    and sign it by returning the appropriate objects.
+
+    The general flow of transaction types is this:
+    BasicTxSpec -> SimpleOperationalTxSpec -> ComposedTxSpec -> SignedTxSpec
+    "basic"     -> "operational"           -> "composed"     -> "signed"
+    """
+
+    def __init__(self, model, config):
+        """Create a transaction transformer object for wallet_model <model>
+        and a wallet configuration <config>
+        """
+        self.model = model
+        self.testnet = config.get('testnet', False)
+
+    def get_tx_composer(self, op_tx_spec):
+        """Returns a function which is able to convert a given operational
+        tx spec <op_tx_spec> into a composed tx spec
+        """
+        if op_tx_spec.is_monocolor():
+            color_def = op_tx_spec.get_targets()[0].get_colordef()
+            if color_def == UNCOLORED_MARKER:
+                return compose_uncolored_tx
+            else:
+                return color_def.compose_tx_spec
+        else:
+            # grab the first color def and hope that its compose_tx_spec
+            # will be able to handle it. if transaction has incompatible
+            # colors, compose_tx_spec will throw an exception
+            for target in op_tx_spec.get_targets():
+                tgt_color_def = target.get_colordef()
+                if tgt_color_def is UNCOLORED_MARKER:
+                    continue
+                else:
+                    return tgt_color_def.compose_tx_spec
+            return None
+
+    def classify_tx_spec(self, tx_spec):
+        """For a transaction <tx_spec>, returns a string that represents
+        the type of transaction (basic, operational, composed, signed)
+        that it is.
+        """
+        if isinstance(tx_spec, BasicTxSpec):
+            return 'basic'
+        elif isinstance(tx_spec, OperationalTxSpec):
+            return 'operational'
+        elif isinstance(tx_spec, ComposedTxSpec):
+            return 'composed'
+        elif isinstance(tx_spec, RawTxSpec):
+            return 'signed'
+        else:
+            return None
+
+    def transform_basic(self, tx_spec, target_spec_kind):
+        """Takes a basic transaction <tx_spec> and returns a transaction
+        of type <target_spec_kind> which is one of (operational,
+        composed, signed).
+        """
+        if target_spec_kind in ['operational', 'composed', 'signed']:
+            if tx_spec.is_monocolor():
+                asset = tx_spec.targets[0].get_asset()
+                operational_ts = tx_spec.make_operational_tx_spec(asset)
+                return self.transform(operational_ts, target_spec_kind)
+        msg = 'Do not know how to transform tx spec!'
+        raise InvalidTransformationError(msg)
+
+    def transform_operational(self, tx_spec, target_spec_kind):
+        """Takes an operational transaction <tx_spec> and returns a
+        transaction of type <target_spec_kind> which is one of
+        (composed, signed).
+        """
+        if target_spec_kind in ['composed', 'signed']:
+            composer = self.get_tx_composer(tx_spec)
+            if composer:
+                composed = composer(tx_spec)
+                return self.transform(composed, target_spec_kind)
+        msg = 'Do not know how to transform tx spec!'
+        raise InvalidTransformationError(msg)
+
+    def transform_composed(self, tx_spec, target_spec_kind):
+        """Takes a SimpleComposedTxSpec <tx_spec> and returns
+        a signed transaction. For now, <target_spec_kind> must
+        equal "signed" or will throw an exception.
+        """
+        if target_spec_kind in ['signed']:
+            rtxs = RawTxSpec.from_composed_tx_spec(self.model, tx_spec)
+            rtxs.sign(tx_spec.get_txins())
+            return rtxs
+        msg = 'Do not know how to transform tx spec!'
+        raise InvalidTransformationError(msg)
+
+    def transform_signed(self, tx_spec, target_spec_kind):
+        """This method is not yet implemented.
+        """
+        msg = 'Do not know how to transform tx spec!'
+        raise InvalidTransformationError(msg)
+
+    def transform(self, tx_spec, target_spec_kind):
+        """Transform a transaction <tx_spec> into another type
+        of transaction defined by <target_spec_kind> and returns it.
+        """
+        spec_kind = self.classify_tx_spec(tx_spec)
+        if spec_kind is None:
+            raise InvalidTransformationError('Spec kind is not recognized!')
+        if spec_kind == target_spec_kind:
+            return tx_spec
+        if spec_kind == 'basic':
+            return self.transform_basic(tx_spec, target_spec_kind)
+        elif spec_kind == 'operational':
+            return self.transform_operational(tx_spec, target_spec_kind)
+        elif spec_kind == 'composed':
+            return self.transform_composed(tx_spec, target_spec_kind)
+        elif spec_kind == 'signed':
+            return self.transform_signed(tx_spec, target_spec_kind)
+
